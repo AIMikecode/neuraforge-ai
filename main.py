@@ -1,108 +1,57 @@
-# main.py - Sistema de gestión de bots con licencias
-import sqlite3
-import asyncio
-import logging
+import hmac
 import hashlib
-import uuid
-from datetime import datetime, timedelta
-from fastapi import FastAPI, Form, HTTPException, Request, Depends
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from telegram import Bot, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
-import uvicorn
-import qrcode
-from io import BytesIO
-import json
+import time
+from fastapi import APIRouter
 
-# --- CONFIGURACIÓN AVANZADA ---
-TOKEN_TELEGRAM = "TU_TOKEN_AQUÍ"
-ADMIN_PASSWORD = "neuraforge_admin_2026"
-DB_NAME = "neuraforge_hive.db"
-SECRET_KEY = "tu_clave_secreta_2026"  # Para ofuscación
+# ... Tus otras configuraciones siguen igual ...
 
-app = FastAPI(title="NeuraForge Hive - Bot Factory")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+BITSO_API_KEY = os.environ.get("BITSO_KEY", "TU_BITSO_API_KEY")
+BITSO_API_SECRET = os.environ.get("BITSO_SECRET", "TU_BITSO_SECRET")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("NeuraForgeHive")
-
-# --- BASE DE DATOS COMPLETA ---
-def init_complete_db():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
+def firmar_peticion_bitso(metodo: str, request_path: str, payload_str: str = "") -> dict:
+    """Genera los headers necesarios para interactuar de forma segura con la API v3 de Bitso."""
+    nonce = str(int(time.time() * 1000))
+    message = nonce + metodo + request_path + payload_str
     
-    # Tabla de licencias/bots
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE,
-            bot_token TEXT,
-            owner_name TEXT,
-            owner_email TEXT,
-            bot_type TEXT DEFAULT 'SAT_ASSISTANT',
-            status TEXT DEFAULT 'active',
-            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            update_count INTEGER DEFAULT 0,
-            serial_hash TEXT,
-            payment_status TEXT DEFAULT 'free',
-            ads_enabled INTEGER DEFAULT 1
-        )
-    ''')
+    signature = hmac.new(
+        BITSO_API_SECRET.encode('utf-8'),
+        message.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
     
-    # Tabla de agentes (modo escucha)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS agents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_license TEXT,
-            agent_name TEXT,
-            telegram_id TEXT,
-            listen_keywords TEXT,  # JSON de palabras clave
-            response_template TEXT,
-            is_active INTEGER DEFAULT 1,
-            FOREIGN KEY (bot_license) REFERENCES bots (license_key)
-        )
-    ''')
-    
-    # Tabla de donaciones/pagos
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS donations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT,
-            amount REAL,
-            currency TEXT DEFAULT 'MXN',
-            payment_method TEXT,
-            transaction_id TEXT UNIQUE,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (license_key) REFERENCES bots (license_key)
-        )
-    ''')
-    
-    # Tabla de actualizaciones (colmena)
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS updates (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            version TEXT,
-            update_type TEXT,
-            description TEXT,
-            file_path TEXT,
-            requires_restart INTEGER DEFAULT 0,
-            pushed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    auth_header = f"Bitso {BITSO_API_KEY}:{nonce}:{signature}"
+    return {
+        "Authorization": auth_header,
+        "Content-Type": "application/json"
+    }
 
-init_complete_db()
+@app.post("/payments/bitso/wallet", tags=["Pasarela de Pagos"])
+def obtener_wallet_deposito(moneda: str = "btc"):
+    """
+    Consulta a Bitso mediante credenciales seguras para obtener la dirección 
+    de depósito (QR/Wallet) para fondear el proyecto.
+    """
+    if BITSO_API_KEY == "TU_BITSO_API_KEY":
+        # Modo de pruebas / Fallback si no hay llaves aún configuradas
+        return {
+            "status": "sandbox",
+            "moneda": moneda.upper(),
+            "instrucciones": "Envía tus fondos a la wallet principal del Tesoro Orion",
+            "wallet_mock": "3FZbgi29cpjq2GjdwV8eyHuJJnkLtktZc5" 
+        }
 
-# --- SISTEMA DE LICENCIAS OFUSCADAS ---
-class LicenseManager:
-    """Genera y valida licencias ofuscadas"""
+    request_path = f"/api/v3/funding_destination/?fund_currency={moneda.lower()}"
+    url = f"https://api.bitso.com{request_path}"
+    
+    try:
+        headers = firmar_peticion_bitso("GET", request_path)
+        response = requests.get(url, headers=headers)
+        return {
+            "status": "success",
+            "data": response.json()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en el puente Crypto: {str(e)}")
     
     @staticmethod
     def generate_license(bot_type: str, email: str) -> dict:
